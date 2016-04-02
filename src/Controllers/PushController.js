@@ -1,20 +1,16 @@
-import { Parse } from 'parse/node';
-import PromiseRouter from '../PromiseRouter';
-import rest from '../rest';
+import { Parse }           from 'parse/node';
+import PromiseRouter       from '../PromiseRouter';
+import rest                from '../rest';
 import AdaptableController from './AdaptableController';
-import { PushAdapter } from '../Adapters/Push/PushAdapter';
-import deepcopy from 'deepcopy';
-import features from '../features';
-import RestQuery from '../RestQuery';
+import { PushAdapter }     from '../Adapters/Push/PushAdapter';
+import deepcopy            from 'deepcopy';
+import RestQuery           from '../RestQuery';
+import pushStatusHandler   from '../pushStatusHandler';
 
 const FEATURE_NAME = 'push';
 const UNSUPPORTED_BADGE_KEY = "unsupported";
 
 export class PushController extends AdaptableController {
-
-  setFeature() {
-    features.setFeature(FEATURE_NAME, this.adapter.feature || {});
-  }
 
   /**
    * Check whether the deviceType parameter in qury condition is valid or not.
@@ -38,9 +34,13 @@ export class PushController extends AdaptableController {
     }
   }
 
-  sendPush(body = {}, where = {}, config, auth) {
+  get pushIsAvailable() {
+    return !!this.adapter;
+  }
+
+  sendPush(body = {}, where = {}, config, auth, wait) {
     var pushAdapter = this.adapter;
-    if (!pushAdapter) {
+    if (!this.pushIsAvailable) {
       throw new Parse.Error(Parse.Error.PUSH_MISCONFIGURED,
                             'Push adapter is not available');
     }
@@ -52,11 +52,10 @@ export class PushController extends AdaptableController {
     let badgeUpdate = () => {
       return Promise.resolve();
     }
-
     if (body.data && body.data.badge) {
       let badge = body.data.badge;
       let op = {};
-      if (badge == "Increment") {
+      if (typeof badge == 'string' && badge.toLowerCase() === 'increment') {
         op = { $inc: { badge: 1 } }
       } else if (Number(badge)) {
         op = { $set: { badge: badge } }
@@ -65,7 +64,7 @@ export class PushController extends AdaptableController {
       }
       let updateWhere = deepcopy(where);
 
-      badgeUpdate = () => { 
+      badgeUpdate = () => {
         let badgeQuery = new RestQuery(config, auth, '_Installation', updateWhere);
         return badgeQuery.buildRestWhere().then(() => {
           let restWhere = deepcopy(badgeQuery.restWhere);
@@ -81,36 +80,53 @@ export class PushController extends AdaptableController {
         })
       }
     }
-
-    return badgeUpdate().then(() => {
+    let pushStatus = pushStatusHandler(config);
+    return Promise.resolve().then(() => {
+      return pushStatus.setInitial(body, where);
+    }).then(() => {
+      return badgeUpdate();
+    }).then(() => {
       return rest.find(config, auth, '_Installation', where);
     }).then((response) => {
-      if (body.data && body.data.badge && body.data.badge == "Increment") {
-        // Collect the badges to reduce the # of calls
-        let badgeInstallationsMap = response.results.reduce((map, installation) => {
-          let badge = installation.badge;
-          if (installation.deviceType != "ios") {
-            badge = UNSUPPORTED_BADGE_KEY;
-          }
-          map[badge+''] = map[badge+''] || [];
-          map[badge+''].push(installation);
-          return map;
-        }, {});
-
-        // Map the on the badges count and return the send result
-        let promises = Object.keys(badgeInstallationsMap).map((badge) => {
-          let payload = deepcopy(body);
-          if (badge == UNSUPPORTED_BADGE_KEY) {
-            delete payload.data.badge;
-          } else {
-            payload.data.badge = parseInt(badge);
-          }
-          return pushAdapter.send(payload, badgeInstallationsMap[badge]);
-        });
-        return Promise.all(promises);
+      if (!response.results) {
+        return Promise.reject({error: 'PushController: no results in query'})
       }
-      return pushAdapter.send(body, response.results);
+      pushStatus.setRunning(response.results);
+      return this.sendToAdapter(body, response.results, pushStatus, config);
+    }).then((results) => {
+      return pushStatus.complete(results);
+    }).catch((err) => {
+      pushStatus.fail(err);
+      return Promise.reject(err);
     });
+  }
+
+  sendToAdapter(body, installations, pushStatus, config) {
+    if (body.data && body.data.badge && typeof body.data.badge == 'string' && body.data.badge.toLowerCase() == "increment") {
+      // Collect the badges to reduce the # of calls
+      let badgeInstallationsMap = installations.reduce((map, installation) => {
+        let badge = installation.badge;
+        if (installation.deviceType != "ios") {
+          badge = UNSUPPORTED_BADGE_KEY;
+        }
+        map[badge+''] = map[badge+''] || [];
+        map[badge+''].push(installation);
+        return map;
+      }, {});
+
+      // Map the on the badges count and return the send result
+      let promises = Object.keys(badgeInstallationsMap).map((badge) => {
+        let payload = deepcopy(body);
+        if (badge == UNSUPPORTED_BADGE_KEY) {
+          delete payload.data.badge;
+        } else {
+          payload.data.badge = parseInt(badge);
+        }
+        return this.adapter.send(payload, badgeInstallationsMap[badge]);
+      });
+      return Promise.all(promises);
+    }
+    return this.adapter.send(body, installations);
   }
 
   /**

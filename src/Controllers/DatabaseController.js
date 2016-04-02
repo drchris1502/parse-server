@@ -1,6 +1,8 @@
 // A database adapter that works with data exported from the hosted
 // Parse database.
 
+import intersect from 'intersect';
+
 var mongodb = require('mongodb');
 var Parse = require('parse/node').Parse;
 
@@ -103,9 +105,14 @@ DatabaseController.prototype.redirectClassNameForKey = function(className, key) 
 // batch request, that could confuse other users of the schema.
 DatabaseController.prototype.validateObject = function(className, object, query, options) {
   let schema;
+  let isMaster = !('acl' in options);
+  var aclGroup = options.acl || [];
   return this.loadSchema().then(s => {
     schema = s;
-    return this.canAddField(schema, className, object, options.acl || []);
+    if (isMaster) {
+      return Promise.resolve();
+    }
+    return this.canAddField(schema, className, object, aclGroup);
   }).then(() => {
     return schema.validateObject(className, object, query);
   });
@@ -139,6 +146,8 @@ DatabaseController.prototype.untransformObject = function(
 //         one of the provided strings must provide the caller with
 //         write permissions.
 DatabaseController.prototype.update = function(className, query, update, options) {
+
+  const originalUpdate = update;
   // Make a copy of the object, so we don't mutate the incoming data.
   update = deepcopy(update);
 
@@ -177,17 +186,26 @@ DatabaseController.prototype.update = function(className, query, update, options
         return Promise.reject(new Parse.Error(Parse.Error.OBJECT_NOT_FOUND,
           'Object not found.'));
       }
-
-      let response = {};
-      let inc = mongoUpdate['$inc'];
-      if (inc) {
-        Object.keys(inc).forEach(key => {
-          response[key] = result[key];
-        });
-      }
-      return response;
+      return sanitizeDatabaseResult(originalUpdate, result);
     });
 };
+
+function sanitizeDatabaseResult(originalObject, result) {
+  let response = {};
+  if (!result) {
+    return Promise.resolve(response);
+  }
+  Object.keys(originalObject).forEach(key => {
+    let keyUpdate = originalObject[key];
+    // determine if that was an op
+    if (keyUpdate && typeof keyUpdate === 'object' && keyUpdate.__op
+      && ['Add', 'AddUnique', 'Remove', 'Increment'].indexOf(keyUpdate.__op) > -1) {
+      // only valid ops that produce an actionable result
+      response[key] = result[key];
+    }
+  });
+  return Promise.resolve(response);
+}
 
 // Processes relation-updating operations from a REST-format update.
 // Returns a promise that resolves successfully when these are
@@ -313,6 +331,7 @@ DatabaseController.prototype.destroy = function(className, query, options = {}) 
 // Returns a promise that resolves successfully iff the object saved.
 DatabaseController.prototype.create = function(className, object, options) {
   // Make a copy of the object, so we don't mutate the incoming data.
+  let originalObject = object;
   object = deepcopy(object);
 
   var schema;
@@ -333,6 +352,9 @@ DatabaseController.prototype.create = function(className, object, options) {
     .then(coll => {
       var mongoObject = transform.transformCreate(schema, className, object);
       return coll.insertOne(mongoObject);
+    })
+    .then(result => {
+      return sanitizeDatabaseResult(originalObject, result.ops[0]);
     });
 };
 
@@ -472,18 +494,28 @@ DatabaseController.prototype.reduceRelationKeys = function(className, query) {
   }
 };
 
-DatabaseController.prototype.addInObjectIdsIds = function(ids, query) {
-  if (typeof query.objectId == 'string') {
-    // Add equality op as we are sure 
-    // we had a constraint on that one
-    query.objectId = {'$eq': query.objectId};
+DatabaseController.prototype.addInObjectIdsIds = function(ids = null, query) {
+  let idsFromString = typeof query.objectId === 'string' ? [query.objectId] : null;
+  let idsFromEq = query.objectId && query.objectId['$eq'] ? [query.objectId['$eq']] : null;
+  let idsFromIn = query.objectId && query.objectId['$in'] ? query.objectId['$in'] : null;
+
+  let allIds = [idsFromString, idsFromEq, idsFromIn, ids].filter(list => list !== null);
+  let totalLength = allIds.reduce((memo, list) => memo + list.length, 0);
+
+  let idsIntersection = [];
+  if (totalLength > 125) {
+    idsIntersection = intersect.big(allIds);
+  } else {
+    idsIntersection = intersect(allIds);
   }
-  query.objectId = query.objectId || {};
-  let queryIn =  [].concat(query.objectId['$in'] || [], ids || []);
-  // make a set and spread to remove duplicates
-  // replace the $in operator as other constraints
-  // may be set
-  query.objectId['$in'] = [...new Set(queryIn)];
+
+  // Need to make sure we don't clobber existing $lt or other constraints on objectId.
+  // Clobbering $eq, $in and shorthand $eq (query.objectId === 'string') constraints
+  // is expected though.
+  if (!('objectId' in query) || typeof query.objectId === 'string') {
+    query.objectId = {};
+  }
+  query.objectId['$in'] = idsIntersection;
 
   return query;
 }
@@ -503,7 +535,7 @@ DatabaseController.prototype.addInObjectIdsIds = function(ids, query) {
 // anything about users, ideally. Then, improve the format of the ACL
 // arg to work like the others.
 DatabaseController.prototype.find = function(className, query, options = {}) {
-  var mongoOptions = {};
+  let mongoOptions = {};
   if (options.skip) {
     mongoOptions.skip = options.skip;
   }
@@ -511,45 +543,39 @@ DatabaseController.prototype.find = function(className, query, options = {}) {
     mongoOptions.limit = options.limit;
   }
 
-  var isMaster = !('acl' in options);
-  var aclGroup = options.acl || [];
-  var acceptor = function(schema) {
-    return schema.hasKeys(className, keysForQuery(query));
-  };
-  var schema;
-  return this.loadSchema(acceptor).then((s) => {
+  let isMaster = !('acl' in options);
+  let aclGroup = options.acl || [];
+  let acceptor = schema => schema.hasKeys(className, keysForQuery(query))
+  let schema = null;
+  return this.loadSchema(acceptor).then(s => {
     schema = s;
     if (options.sort) {
       mongoOptions.sort = {};
-      for (var key in options.sort) {
-        var mongoKey = transform.transformKey(schema, className, key);
+      for (let key in options.sort) {
+        let mongoKey = transform.transformKey(schema, className, key);
         mongoOptions.sort[mongoKey] = options.sort[key];
       }
     }
 
     if (!isMaster) {
-      var op = 'find';
-      var k = Object.keys(query);
-      if (k.length == 1 && typeof query.objectId == 'string') {
-        op = 'get';
-      }
+      let op = typeof query.objectId == 'string' && Object.keys(query).length === 1 ?
+        'get' :
+        'find';
       return schema.validatePermission(className, aclGroup, op);
     }
     return Promise.resolve();
-  }).then(() => {
-    return this.reduceRelationKeys(className, query);
-  }).then(() => {
-    return this.reduceInRelation(className, query, schema);
-  }).then(() => {
-    return this.adaptiveCollection(className);
-  }).then(collection => {
-    var mongoWhere = transform.transformWhere(schema, className, query);
+  })
+  .then(() => this.reduceRelationKeys(className, query))
+  .then(() => this.reduceInRelation(className, query, schema))
+  .then(() => this.adaptiveCollection(className))
+  .then(collection => {
+    let mongoWhere = transform.transformWhere(schema, className, query);
     if (!isMaster) {
-      var orParts = [
+      let orParts = [
         {"_rperm" : { "$exists": false }},
         {"_rperm" : { "$in" : ["*"]}}
       ];
-      for (var acl of aclGroup) {
+      for (let acl of aclGroup) {
         orParts.push({"_rperm" : { "$in" : [acl]}});
       }
       mongoWhere = {'$and': [mongoWhere, {'$or': orParts}]};

@@ -1,6 +1,9 @@
 var request = require('request');
 var parseServerPackage = require('../package.json');
 var MockEmailAdapterWithOptions = require('./MockEmailAdapterWithOptions');
+var ParseServer = require("../src/index");
+var Config = require('../src/Config');
+var express = require('express');
 
 describe('server', () => {
   it('requires a master key and app id', done => {
@@ -54,6 +57,7 @@ describe('server', () => {
       fileKey: 'test',
       verifyUserEmails: true,
       emailAdapter: MockEmailAdapterWithOptions({
+        fromAddress: 'parse@example.com',
         apiKey: 'k',
         domain: 'd',
       }),
@@ -78,6 +82,7 @@ describe('server', () => {
       emailAdapter: {
         class: MockEmailAdapterWithOptions,
         options: {
+          fromAddress: 'parse@example.com',
           apiKey: 'k',
           domain: 'd',
         }
@@ -101,8 +106,9 @@ describe('server', () => {
       fileKey: 'test',
       verifyUserEmails: true,
       emailAdapter: {
-        module: './Email/SimpleMailgunAdapter',
+        module: 'parse-server-simple-mailgun-adapter',
         options: {
+          fromAddress: 'parse@example.com',
           apiKey: 'k',
           domain: 'd',
         }
@@ -125,9 +131,9 @@ describe('server', () => {
       collectionPrefix: 'test_',
       fileKey: 'test',
       verifyUserEmails: true,
-      emailAdapter: './Email/SimpleMailgunAdapter',
+      emailAdapter: 'parse-server-simple-mailgun-adapter',
       publicServerURL: 'http://localhost:8378/1'
-    })).toThrow('SimpleMailgunAdapter requires an API Key and domain.');
+    })).toThrow('SimpleMailgunAdapter requires an API Key, domain, and fromAddress.');
     done();
   });
 
@@ -145,13 +151,13 @@ describe('server', () => {
       fileKey: 'test',
       verifyUserEmails: true,
       emailAdapter: {
-        module: './Email/SimpleMailgunAdapter',
+        module: 'parse-server-simple-mailgun-adapter',
         options: {
           domain: 'd',
         }
       },
       publicServerURL: 'http://localhost:8378/1'
-    })).toThrow('SimpleMailgunAdapter requires an API Key and domain.');
+    })).toThrow('SimpleMailgunAdapter requires an API Key, domain, and fromAddress.');
     done();
   });
 
@@ -167,5 +173,111 @@ describe('server', () => {
       expect(body.parseServerVersion).toEqual(parseServerPackage.version);
       done();
     })
+  });
+
+  it('can create a parse-server', done => {
+    var parseServer = new ParseServer.default({
+      appId: "aTestApp",
+      masterKey: "aTestMasterKey",
+      serverURL: "http://localhost:12666/parse",
+      databaseURI: 'mongodb://localhost:27017/aTestApp'
+    });
+
+    expect(Parse.applicationId).toEqual("aTestApp");
+    var app = express();
+    app.use('/parse', parseServer.app);
+
+    var server = app.listen(12666);
+    var obj  = new Parse.Object("AnObject");
+    var objId;
+    obj.save().then((obj) => {
+      objId = obj.id;
+      var q = new Parse.Query("AnObject");
+      return q.first();
+    }).then((obj) => {
+      expect(obj.id).toEqual(objId);
+      server.close();
+      done();
+    }).fail((err) => {
+      server.close();
+      done();
+    })
+  });
+
+  it('can create a parse-server', done => {
+    var parseServer = ParseServer.ParseServer({
+      appId: "anOtherTestApp",
+      masterKey: "anOtherTestMasterKey",
+      serverURL: "http://localhost:12667/parse",
+      databaseURI: 'mongodb://localhost:27017/anotherTstApp'
+    });
+
+    expect(Parse.applicationId).toEqual("anOtherTestApp");
+    var app = express();
+    app.use('/parse', parseServer);
+
+    var server = app.listen(12667);
+    var obj  = new Parse.Object("AnObject");
+    var objId;
+    obj.save().then((obj) => {
+      objId = obj.id;
+      var q = new Parse.Query("AnObject");
+      return q.first();
+    }).then((obj) => {
+      expect(obj.id).toEqual(objId);
+      server.close();
+      done();
+    }).fail((err) => {
+      server.close();
+      done();
+    })
+  });
+
+  it('has createLiveQueryServer', done => {
+    // original implementation through the factory
+    expect(typeof ParseServer.ParseServer.createLiveQueryServer).toEqual('function');
+    // For import calls
+    expect(typeof ParseServer.default.createLiveQueryServer).toEqual('function');
+    done();
+  });
+
+  it('exposes all the "core" adapters', done => {
+    expect(ParseServer.S3Adapter).toThrow();
+    expect(ParseServer.GCSAdapter).toThrow('GCSAdapter requires an projectId');
+    expect(ParseServer.FileSystemAdapter).toThrow();
+    done();
+  });
+
+  it('properly gives publicServerURL when set', done => {
+    setServerConfiguration({
+      serverURL: 'http://localhost:8378/1',
+      appId: 'test',
+      masterKey: 'test',
+      publicServerURL: 'https://myserver.com/1'
+    });
+    var config = new Config('test', 'http://localhost:8378/1');
+    expect(config.mount).toEqual('https://myserver.com/1');
+    done();
+  });
+
+  it('properly removes trailing slash in mount', done => {
+    setServerConfiguration({
+      serverURL: 'http://localhost:8378/1',
+      appId: 'test',
+      masterKey: 'test'
+    });
+    var config = new Config('test', 'http://localhost:8378/1/');
+    expect(config.mount).toEqual('http://localhost:8378/1');
+    done();
+  });
+
+  it('should throw when getting invalid mount', done => {
+    expect(() => setServerConfiguration({
+      serverURL: 'http://localhost:8378/1',
+      appId: 'test',
+      masterKey: 'test',
+      publicServerURL: 'blabla:/some'
+    }) ).toThrow("publicServerURL should be a valid HTTPS URL starting with https://");
+    done();
   });
 });

@@ -1,3 +1,4 @@
+import log from './logger';
 var mongodb = require('mongodb');
 var Parse = require('parse/node').Parse;
 
@@ -87,7 +88,7 @@ export function transformKeyValue(schema, className, restKey, restValue, options
       return transformWhere(schema, className, s);
     });
     return {key: '$and', value: mongoSubqueries};
-  default:  
+  default:
     // Other auth data
     var authDataMatch = key.match(/^authData\.([a-zA-Z0-9_]+)\.id$/);
     if (authDataMatch) {
@@ -186,13 +187,12 @@ export function transformKeyValue(schema, className, restKey, restValue, options
 // Returns the mongo form of the query.
 // Throws a Parse.Error if the input query is invalid.
 function transformWhere(schema, className, restWhere) {
-  var mongoWhere = {};
+  let mongoWhere = {};
   if (restWhere['ACL']) {
-    throw new Parse.Error(Parse.Error.INVALID_QUERY,
-                          'Cannot query on ACL.');
+    throw new Parse.Error(Parse.Error.INVALID_QUERY, 'Cannot query on ACL.');
   }
-  for (var restKey in restWhere) {
-    var out = transformKeyValue(schema, className, restKey, restWhere[restKey],
+  for (let restKey in restWhere) {
+    let out = transformKeyValue(schema, className, restKey, restWhere[restKey],
                                 {query: true, validate: true});
     mongoWhere[out.key] = out.value;
   }
@@ -224,7 +224,7 @@ function transformUpdate(schema, className, restUpdate) {
   if (className == '_User') {
     restUpdate = transformAuthData(restUpdate);
   }
-  
+
   var mongoUpdate = {};
   var acl = transformACL(restUpdate);
   if (acl._rperm || acl._wperm) {
@@ -260,7 +260,14 @@ function transformUpdate(schema, className, restUpdate) {
 function transformAuthData(restObject) {
   if (restObject.authData) {
     Object.keys(restObject.authData).forEach((provider) => {
-      restObject[`_auth_data_${provider}`] = restObject.authData[provider];
+      let providerData = restObject.authData[provider];
+      if (providerData == null) {
+        restObject[`_auth_data_${provider}`] = {
+          __op: 'Delete'
+        }
+      } else {
+        restObject[`_auth_data_${provider}`] = providerData;
+      }
     });
     delete restObject.authData;
   }
@@ -391,6 +398,9 @@ function transformAtom(atom, force, options) {
     if (FileCoder.isValidJSON(atom)) {
       return (inArray || inObject ? atom : FileCoder.JSONToDatabase(atom));
     }
+    if (inArray || inObject) {
+      return atom;
+    }
 
     if (force) {
       throw new Parse.Error(Parse.Error.INVALID_JSON,
@@ -442,7 +452,7 @@ function transformConstraint(constraint, inArray) {
                               'bad ' + key + ' value');
       }
       answer[key] = arr.map((v) => {
-        return transformAtom(v, true);
+        return transformAtom(v, true, { inArray: inArray });
       });
       break;
 
@@ -681,13 +691,13 @@ function untransformObject(schema, className, mongoObject, isNestedObject = fals
             expected = schema.getExpectedType(className, newKey);
           }
           if (!expected) {
-            console.log(
+            log.info('transform.js',
               'Found a pointer column not in the schema, dropping it.',
               className, newKey);
             break;
           }
           if (expected && expected[0] != '*') {
-            console.log('Found a pointer in a non-pointer column, dropping it.', className, key);
+            log.info('transform.js', 'Found a pointer in a non-pointer column, dropping it.', className, key);
             break;
           }
           if (mongoObject[key] === null) {
@@ -823,4 +833,3 @@ module.exports = {
   transformWhere: transformWhere,
   untransformObject: untransformObject
 };
-

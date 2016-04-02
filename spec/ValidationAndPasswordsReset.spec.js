@@ -23,9 +23,9 @@ describe("Custom Pages Configuration", () => {
       },
       publicServerURL: "https://my.public.server.com/1"
     });
-    
+
     var config = new Config("test");
-    
+
     expect(config.invalidLinkURL).toEqual("myInvalidLink");
     expect(config.verifyEmailSuccessURL).toEqual("myVerifyEmailSuccess");
     expect(config.choosePasswordURL).toEqual("myChoosePassword");
@@ -78,7 +78,7 @@ describe("Email Verification", () => {
       }
     });
   });
-  
+
   it('does not send verification email when verification is enabled and email is not set', done => {
     var emailAdapter = {
       sendVerificationEmail: () => Promise.resolve(),
@@ -119,7 +119,7 @@ describe("Email Verification", () => {
       }
     });
   });
-  
+
   it('does send a validation email when updating the email', done => {
     var emailAdapter = {
       sendVerificationEmail: () => Promise.resolve(),
@@ -156,7 +156,7 @@ describe("Email Verification", () => {
           return user.fetch();
         }).then(() => {
           expect(user.get('emailVerified')).toEqual(false);
-          // Wait as on update emai, we need to fetch the username
+          // Wait as on update email, we need to fetch the username
           setTimeout(function(){
             expect(emailAdapter.sendVerificationEmail).toHaveBeenCalled();
             done();
@@ -169,7 +169,61 @@ describe("Email Verification", () => {
       }
     });
   });
-  
+
+  it('does send a validation email with valid verification link when updating the email', done => {
+    var emailAdapter = {
+      sendVerificationEmail: () => Promise.resolve(),
+      sendPasswordResetEmail: () => Promise.resolve(),
+      sendMail: () => Promise.resolve()
+    }
+    setServerConfiguration({
+      serverURL: 'http://localhost:8378/1',
+      appId: 'test',
+      appName: 'unused',
+      javascriptKey: 'test',
+      dotNetKey: 'windows',
+      clientKey: 'client',
+      restAPIKey: 'rest',
+      masterKey: 'test',
+      collectionPrefix: 'test_',
+      fileKey: 'test',
+      verifyUserEmails: true,
+      emailAdapter: emailAdapter,
+      publicServerURL: "http://localhost:8378/1"
+    });
+    spyOn(emailAdapter, 'sendVerificationEmail').and.callFake((options) => {
+      expect(options.link).not.toBeNull();
+      expect(options.link).not.toMatch(/token=undefined/);
+      Promise.resolve();
+    });
+    var user = new Parse.User();
+    user.setPassword("asdf");
+    user.setUsername("zxcv");
+    user.signUp(null, {
+      success: function(user) {
+        expect(emailAdapter.sendVerificationEmail).not.toHaveBeenCalled();
+        user.fetch()
+        .then((user) => {
+          user.set("email", "cool_guy@parse.com");
+          return user.save();
+        }).then((user) => {
+          return user.fetch();
+        }).then(() => {
+          expect(user.get('emailVerified')).toEqual(false);
+          // Wait as on update email, we need to fetch the username
+          setTimeout(function(){
+            expect(emailAdapter.sendVerificationEmail).toHaveBeenCalled();
+            done();
+          }, 200);
+        });
+      },
+      error: function(userAgain, error) {
+        fail('Failed to save user');
+        done();
+      }
+    });
+  });
+
   it('does send with a simple adapter', done => {
     var calls = 0;
     var emailAdapter = {
@@ -311,7 +365,7 @@ describe("Email Verification", () => {
           followRedirect: false,
         }, (error, response, body) => {
           expect(response.statusCode).toEqual(302);
-          expect(response.body).toEqual('Found. Redirecting to http://localhost:8378/1/apps/verify_email_success.html?username=zxcv');
+          expect(response.body).toEqual('Found. Redirecting to http://localhost:8378/1/apps/verify_email_success.html?username=user');
           user.fetch()
           .then(() => {
             expect(user.get('emailVerified')).toEqual(true);
@@ -342,7 +396,7 @@ describe("Email Verification", () => {
       publicServerURL: "http://localhost:8378/1"
     });
     user.setPassword("asdf");
-    user.setUsername("zxcv");
+    user.setUsername("user");
     user.set('email', 'user@parse.com');
     user.signUp();
   });
@@ -453,7 +507,7 @@ describe("Email Verification", () => {
 });
 
 describe("Password Reset", () => {
-  
+
   it('should send a password reset link', done => {
     var user = new Parse.User();
     var emailAdapter = {
@@ -468,7 +522,7 @@ describe("Password Reset", () => {
             return;
           }
           expect(response.statusCode).toEqual(302);
-          var re = /http:\/\/localhost:8378\/1\/apps\/choose_password\?token=[a-zA-Z0-9]+\&id=test\&username=zxcv/;
+          var re = /http:\/\/localhost:8378\/1\/apps\/choose_password\?token=[a-zA-Z0-9]+\&id=test\&username=zxcv%2Bzxcv/;
           expect(response.body.match(re)).not.toBe(null);
           done();
         });
@@ -491,7 +545,7 @@ describe("Password Reset", () => {
       publicServerURL: "http://localhost:8378/1"
     });
     user.setPassword("asdf");
-    user.setUsername("zxcv");
+    user.setUsername("zxcv+zxcv");
     user.set('email', 'user@parse.com');
     user.signUp().then(() => {
       Parse.User.requestPasswordReset('user@parse.com', {
@@ -503,7 +557,7 @@ describe("Password Reset", () => {
       });
     });
   });
-  
+
   it('redirects you to invalid link if you try to request password for a nonexistant users email', done => {
     setServerConfiguration({
       serverURL: 'http://localhost:8378/1',
@@ -555,8 +609,8 @@ describe("Password Reset", () => {
             return;
           }
           var token = match[1];
-          
-          request.post({ 
+
+          request.post({
             url: "http://localhost:8378/1/apps/test/request_password_reset" ,
             body: `new_password=hello&token=${token}&username=zxcv`,
             headers: {
@@ -571,15 +625,23 @@ describe("Password Reset", () => {
             }
             expect(response.statusCode).toEqual(302);
             expect(response.body).toEqual('Found. Redirecting to http://localhost:8378/1/apps/password_reset_success.html');
-            
+
             Parse.User.logIn("zxcv", "hello").then(function(user){
-              done();
+              let config = new Config('test');
+              config.database.adaptiveCollection('_User')
+              .then(coll => coll.find({ 'username': 'zxcv' }, { limit: 1 }))
+              .then((results) => {
+                // _perishable_token should be unset after reset password
+                expect(results.length).toEqual(1);
+                expect(results[0]['_perishable_token']).toEqual(undefined);
+                done();
+              });
             }, (err) => {
               console.error(err);
               fail("should login with new password");
               done();
             });
-            
+
           });
         });
       },
@@ -613,6 +675,5 @@ describe("Password Reset", () => {
       });
     });
   });
-  
-})
 
+})
